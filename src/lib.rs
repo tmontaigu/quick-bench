@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::env::Args;
+use std::mem::MaybeUninit;
 use std::time::Duration;
 
 #[derive(Default)]
@@ -17,6 +18,85 @@ pub struct OrchestratorConfig {
 // * QuickBencher type
 //   * with a measure<F, R>(f: F) -> R
 //   * user call print stats at the end
+//
+
+/// Simple struct to do quick 'benchmark'
+///
+/// This is a simple bencher where the caller controls when the
+/// samples are measured. There is not warmup phase.
+///
+///
+/// # Example
+/// ```
+/// # fn fibonacci(n: i32) -> i32 {
+/// #     if n <= 0 {
+/// #         0
+/// #     } else if n == 1 {
+/// #         1
+/// #     } else {
+/// #         fibonacci(n - 1) + fibonacci(n - 2)
+/// #     }
+/// # }
+/// use quick_bench::QuickBencher;
+///
+/// let mut bencher = QuickBencher::new();
+///
+/// for _ in 0..10 {
+///     let fib_result = bencher.sample_once(|| fibonacci(14));
+///     assert_eq!(fib_result, 377);
+/// }
+///
+/// bencher.compute_and_print_stats();
+/// ```
+pub struct QuickBencher {
+    samples: Vec<Sample>,
+}
+
+impl QuickBencher {
+    const ITER_PER_SAMPLE: usize = 1;
+
+    pub fn new() -> Self {
+        Self { samples: vec![] }
+    }
+
+    pub fn clear_samples(&mut self) {
+        self.samples.clear();
+    }
+
+    pub fn sample_once<F, O>(&mut self, func: F) -> O
+    where
+        F: Fn() -> O,
+    {
+        let mut output = SingleOutputContainer::<O>::new();
+        let duration = sample_time(&func, Self::ITER_PER_SAMPLE as u64, &mut output);
+        self.samples.push(Sample { duration });
+        output.unwrap()
+    }
+
+    pub fn compute_and_print_stats(&self) {
+        if self.samples.is_empty() {
+            println!("No samples");
+            return;
+        }
+
+        let SampleStats {
+            num_outliers: outliers,
+            min,
+            max,
+            avg,
+            std_dev: stddev,
+        } = SampleStats::compute(self.samples.as_slice(), Self::ITER_PER_SAMPLE);
+        println!("Samples: {}, Outliers: {}", self.samples.len(), outliers);
+        println!("Average: {avg:?}, min: {min:?}, max: {max:?}, stddev: {stddev:?}");
+        println!();
+    }
+}
+
+impl Default for QuickBencher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Copy, Clone, Debug)]
 pub struct BencherConfig {
@@ -389,9 +469,79 @@ impl Default for Runner {
     }
 }
 
+pub trait OutputContainer<T> {
+    fn push(&mut self, value: T);
+}
+
+impl<T> OutputContainer<T> for Vec<T> {
+    fn push(&mut self, value: T) {
+        self.push(value);
+    }
+}
+
+struct SingleOutputContainer<T> {
+    output: MaybeUninit<T>,
+    is_init: bool,
+}
+
+impl<T> SingleOutputContainer<T> {
+    fn new() -> Self {
+        Self {
+            output: MaybeUninit::uninit(),
+            is_init: false,
+        }
+    }
+
+    fn unwrap(mut self) -> T {
+        self.replace().expect("The value is not initialized")
+    }
+
+    fn replace(&mut self) -> Option<T> {
+        if self.is_init {
+            let old = std::mem::replace(&mut self.output, MaybeUninit::uninit());
+            self.is_init = false;
+            unsafe {
+                // SAFETY:
+                // The invariant is that when is_init is true, the data is init
+                Some(old.assume_init())
+            }
+        } else {
+            None
+        }
+    }
+}
+
+impl<T> OutputContainer<T> for SingleOutputContainer<T> {
+    fn push(&mut self, value: T) {
+        if self.is_init {
+            unsafe {
+                // SAFETY:
+                // The invariant is that when is_init is true, the data is init
+                self.output.assume_init_drop();
+            }
+        }
+        self.output.write(value);
+        self.is_init = true;
+    }
+}
+
+impl<T> Drop for SingleOutputContainer<T> {
+    fn drop(&mut self) {
+        if self.is_init {
+            unsafe {
+                // SAFETY:
+                // The invariant is that when is_init is true, the data is init
+                self.output.assume_init_drop();
+            }
+            // No need to reset is_init as we are getting dropped
+        }
+    }
+}
+
 #[inline]
-fn sample_time<F, O>(f: &F, iters_per_sample: u64, outputs: &mut Vec<O>) -> Duration
+fn sample_time<F, OutCont, O>(f: &F, iters_per_sample: u64, outputs: &mut OutCont) -> Duration
 where
+    OutCont: OutputContainer<O>,
     F: Fn() -> O,
 {
     let now = std::time::Instant::now();
