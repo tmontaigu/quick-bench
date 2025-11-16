@@ -40,12 +40,12 @@ fn parse_args(args: &mut Args) -> OrchestratorConfig {
     let mut config = OrchestratorConfig::default();
 
     // Skip first arg, which is the binary name
-    if let None = iter.next() {
+    if iter.next().is_none() {
         return config;
     }
 
     // Then '--' (at least when invoked from cargo bench)
-    if let None = iter.next() {
+    if iter.next().is_none() {
         return config;
     }
 
@@ -62,15 +62,17 @@ fn parse_args(args: &mut Args) -> OrchestratorConfig {
             continue;
         }
 
-        if arg.starts_with("--") {
-            let (key_str, value_str) = if arg.contains("=") {
-                let mut split = arg[2..].splitn(2, '=');
+        if let Some(long_arg) = arg.strip_prefix("--") {
+            let (key_str, value_str) = if long_arg.contains("=") {
+                // The arg is key=value
+                let mut split = long_arg.splitn(2, '=');
                 (
                     Cow::Borrowed(split.next().unwrap()),
                     Cow::Borrowed(split.next().unwrap()),
                 )
             } else {
-                let key_str = &arg[2..];
+                // The value is on the next arg
+                let key_str = long_arg;
                 let value_str = iter.next().unwrap();
                 (Cow::Borrowed(key_str), Cow::Owned(value_str))
             };
@@ -251,8 +253,10 @@ impl Bencher {
     }
 }
 
+pub type BoxedBench = Box<dyn FnMut(&'_ mut Bencher)>;
+
 pub struct BenchStore {
-    vec: Vec<(String, Box<dyn FnMut(&'_ mut Bencher)>)>,
+    vec: Vec<(String, BoxedBench)>,
     filter: Option<regex::Regex>,
     default_config: BencherConfig,
     bencher: Bencher,
@@ -329,6 +333,12 @@ impl BenchStore {
     }
 }
 
+impl Default for BenchStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct Runner {
     filter: Option<regex::Regex>,
     default_config: BencherConfig,
@@ -361,10 +371,7 @@ impl Runner {
     }
 
     pub fn run(&mut self, id: &str, mut callback: impl FnMut(&mut Bencher)) {
-        let should_run = self
-            .filter
-            .as_ref()
-            .map_or(true, |regex| regex.is_match(id));
+        let should_run = self.filter.as_ref().is_none_or(|regex| regex.is_match(id));
 
         if should_run {
             println!("{id} : Running");
@@ -373,6 +380,12 @@ impl Runner {
         } else {
             println!("{id}: Skipped");
         }
+    }
+}
+
+impl Default for Runner {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
