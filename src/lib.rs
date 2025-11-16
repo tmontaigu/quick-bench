@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::env::Args;
-use std::mem::MaybeUninit;
 use std::time::Duration;
 
 #[derive(Default)]
@@ -67,10 +66,12 @@ impl QuickBencher {
     where
         F: Fn() -> O,
     {
-        let mut output = SingleOutputContainer::<O>::new();
-        let duration = sample_time(&func, Self::ITER_PER_SAMPLE as u64, &mut output);
-        self.samples.push(Sample { duration });
-        output.unwrap()
+        let now = std::time::Instant::now();
+        let o = func();
+        self.samples.push(Sample {
+            duration: now.elapsed(),
+        });
+        o
     }
 
     pub fn compute_and_print_stats(&self) {
@@ -479,69 +480,9 @@ impl<T> OutputContainer<T> for Vec<T> {
     }
 }
 
-struct SingleOutputContainer<T> {
-    output: MaybeUninit<T>,
-    is_init: bool,
-}
-
-impl<T> SingleOutputContainer<T> {
-    fn new() -> Self {
-        Self {
-            output: MaybeUninit::uninit(),
-            is_init: false,
-        }
-    }
-
-    fn unwrap(mut self) -> T {
-        self.replace().expect("The value is not initialized")
-    }
-
-    fn replace(&mut self) -> Option<T> {
-        if self.is_init {
-            let old = std::mem::replace(&mut self.output, MaybeUninit::uninit());
-            self.is_init = false;
-            unsafe {
-                // SAFETY:
-                // The invariant is that when is_init is true, the data is init
-                Some(old.assume_init())
-            }
-        } else {
-            None
-        }
-    }
-}
-
-impl<T> OutputContainer<T> for SingleOutputContainer<T> {
-    fn push(&mut self, value: T) {
-        if self.is_init {
-            unsafe {
-                // SAFETY:
-                // The invariant is that when is_init is true, the data is init
-                self.output.assume_init_drop();
-            }
-        }
-        self.output.write(value);
-        self.is_init = true;
-    }
-}
-
-impl<T> Drop for SingleOutputContainer<T> {
-    fn drop(&mut self) {
-        if self.is_init {
-            unsafe {
-                // SAFETY:
-                // The invariant is that when is_init is true, the data is init
-                self.output.assume_init_drop();
-            }
-            // No need to reset is_init as we are getting dropped
-        }
-    }
-}
-
 #[inline]
-fn sample_time<F, OutCont, O>(f: &F, iters_per_sample: u64, outputs: &mut OutCont) -> Duration
+fn sample_time<F, O>(f: &F, iters_per_sample: u64, outputs: &mut Vec<O>) -> Duration
 where
-    OutCont: OutputContainer<O>,
     F: Fn() -> O,
 {
     let now = std::time::Instant::now();
