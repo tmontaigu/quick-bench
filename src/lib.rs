@@ -13,11 +13,6 @@ pub struct OrchestratorConfig {
 //   to allow user to then parse its own args. (or use `--` as separator)
 // * override bencher settings
 // * write measurements to file;
-//
-// * QuickBencher type
-//   * with a measure<F, R>(f: F) -> R
-//   * user call print stats at the end
-//
 
 /// Simple struct to do quick 'benchmark'
 ///
@@ -86,7 +81,8 @@ impl QuickBencher {
             max,
             avg,
             std_dev: stddev,
-        } = SampleStats::compute(self.samples.as_slice(), Self::ITER_PER_SAMPLE);
+            throughput: _,
+        } = SampleStats::compute(self.samples.as_slice(), Self::ITER_PER_SAMPLE, None);
         println!("Samples: {}, Outliers: {}", self.samples.len(), outliers);
         println!("Average: {avg:?}, min: {min:?}, max: {max:?}, stddev: {stddev:?}");
         println!();
@@ -97,6 +93,11 @@ impl Default for QuickBencher {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum Throughput {
+    Elements(u64),
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -165,7 +166,7 @@ fn parse_args(args: &mut Args) -> OrchestratorConfig {
             } else if key_str == "warmup-samples" {
                 config.bencher_config.warmup_samples = value_str.parse::<usize>().unwrap();
             } else {
-                println!("Unknown argument: {}", arg);
+                println!("Unknown argument: {arg}");
             }
         } else {
             config.filter = Some(regex::Regex::new(&arg).unwrap());
@@ -186,10 +187,11 @@ struct SampleStats {
     max: Duration,
     avg: Duration,
     std_dev: Duration,
+    throughput: Option<f64>,
 }
 
 impl SampleStats {
-    fn compute(samples: &[Sample], iter_per_sample: usize) -> Self {
+    fn compute(samples: &[Sample], iter_per_sample: usize, throughput: Option<Throughput>) -> Self {
         let (mut inliers, outliers) = split_outliers(samples);
 
         let mut sum = inliers[0].duration;
@@ -231,12 +233,21 @@ impl SampleStats {
         min /= iter_per_sample as u32;
         max /= iter_per_sample as u32;
 
+        let throughput = throughput.map(|t| match t {
+            Throughput::Elements(n) => {
+                let total = n * iter_per_sample as u64 * inliers.len() as u64;
+                let elem_per_secs = total as f64 / sum.as_secs_f64();
+                elem_per_secs
+            }
+        });
+
         Self {
             num_outliers: outliers.len(),
             min,
             max,
             avg: average,
             std_dev: stddev,
+            throughput,
         }
     }
 }
@@ -244,6 +255,7 @@ impl SampleStats {
 pub struct Bencher {
     config: BencherConfig,
     samples: Vec<Sample>,
+    throughput: Option<Throughput>,
 }
 
 impl Bencher {
@@ -252,6 +264,7 @@ impl Bencher {
         Self {
             config,
             samples: stats,
+            throughput: None,
         }
     }
 
@@ -261,6 +274,10 @@ impl Bencher {
 
     pub fn config_mut(&mut self) -> &mut BencherConfig {
         &mut self.config
+    }
+
+    pub fn throughput(&mut self, throughput: Throughput) {
+        self.throughput = Some(throughput);
     }
 
     pub fn bench<F, O>(&mut self, f: F)
@@ -327,9 +344,17 @@ impl Bencher {
             max,
             avg,
             std_dev: stddev,
-        } = SampleStats::compute(self.samples.as_slice(), self.config.iter_per_sample);
+            throughput,
+        } = SampleStats::compute(
+            self.samples.as_slice(),
+            self.config.iter_per_sample,
+            self.throughput,
+        );
         println!("\tSamples: {}, Outliers: {}", self.samples.len(), outliers);
         println!("\tAverage: {avg:?}, min: {min:?}, max: {max:?}, stddev: {stddev:?}");
+        if let Some(t) = throughput {
+            println!("\tThroughput: {t} e/s");
+        }
         println!();
     }
 }
@@ -467,16 +492,6 @@ impl Runner {
 impl Default for Runner {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-pub trait OutputContainer<T> {
-    fn push(&mut self, value: T);
-}
-
-impl<T> OutputContainer<T> for Vec<T> {
-    fn push(&mut self, value: T) {
-        self.push(value);
     }
 }
 

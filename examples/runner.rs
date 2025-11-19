@@ -1,4 +1,4 @@
-use quick_bench::Runner;
+use quick_bench::{Runner, Throughput};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
@@ -92,6 +92,7 @@ fn main() {
     });
 
     runner.run("LargeDrop", |bencher| {
+        bencher.throughput(Throughput::Elements(1));
         bencher.bench(|| LargeDrop::fake_compute(Duration::from_secs(1), Duration::from_secs(1)));
     });
 
