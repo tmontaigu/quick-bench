@@ -1,4 +1,4 @@
-use std::hint::black_box;
+use std::{hint::black_box, time::Duration};
 
 use quick_bench::{Bencher, GenericBencher, NoExtraMetric, Runner, cpu_time::CpuLoad};
 
@@ -36,7 +36,7 @@ fn main() {
         [10, 20, 30, 32],
     );
 
-    runner.run("lol", |bencher| {
+    runner.run("parallel func", |bencher| {
         bencher.bench(|| {
             rayon::broadcast(|_| work());
         });
