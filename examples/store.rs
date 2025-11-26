@@ -1,4 +1,4 @@
-use quick_bench::{BenchStore};
+use quick_bench::BenchStore;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 

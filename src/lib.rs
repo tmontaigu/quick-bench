@@ -1,6 +1,15 @@
-use std::borrow::Cow;
 use std::env::Args;
+use std::fmt::Write;
+use std::ops::{Add, Div, Sub};
 use std::time::Duration;
+
+use crate::util::parse_args;
+use crate::wall_time::{WallTime, WallTimeSample, WallTimeStats};
+
+mod quick;
+mod util;
+
+pub use quick::QuickBencher;
 
 #[derive(Default)]
 pub struct OrchestratorConfig {
@@ -13,87 +22,6 @@ pub struct OrchestratorConfig {
 //   to allow user to then parse its own args. (or use `--` as separator)
 // * override bencher settings
 // * write measurements to file;
-
-/// Simple struct to do quick 'benchmark'
-///
-/// This is a simple bencher where the caller controls when the
-/// samples are measured. There is not warmup phase.
-///
-///
-/// # Example
-/// ```
-/// # fn fibonacci(n: i32) -> i32 {
-/// #     if n <= 0 {
-/// #         0
-/// #     } else if n == 1 {
-/// #         1
-/// #     } else {
-/// #         fibonacci(n - 1) + fibonacci(n - 2)
-/// #     }
-/// # }
-/// use quick_bench::QuickBencher;
-///
-/// let mut bencher = QuickBencher::new();
-///
-/// for _ in 0..10 {
-///     let fib_result = bencher.sample_once(|| fibonacci(14));
-///     assert_eq!(fib_result, 377);
-/// }
-///
-/// bencher.compute_and_print_stats();
-/// ```
-pub struct QuickBencher {
-    samples: Vec<Sample>,
-}
-
-impl QuickBencher {
-    const ITER_PER_SAMPLE: usize = 1;
-
-    pub fn new() -> Self {
-        Self { samples: vec![] }
-    }
-
-    pub fn clear_samples(&mut self) {
-        self.samples.clear();
-    }
-
-    pub fn sample_once<F, O>(&mut self, func: F) -> O
-    where
-        F: Fn() -> O,
-    {
-        let now = std::time::Instant::now();
-        let o = func();
-        self.samples.push(Sample {
-            duration: now.elapsed(),
-        });
-        o
-    }
-
-    pub fn compute_and_print_stats(&self) {
-        if self.samples.is_empty() {
-            println!("No samples");
-            return;
-        }
-
-        let SampleStats {
-            num_outliers: outliers,
-            min,
-            max,
-            avg,
-            std_dev: stddev,
-            throughput: _,
-        } = SampleStats::compute(self.samples.as_slice(), Self::ITER_PER_SAMPLE, None);
-        println!("Samples: {}, Outliers: {}", self.samples.len(), outliers);
-        println!("Average: {avg:?}, min: {min:?}, max: {max:?}, stddev: {stddev:?}");
-        println!();
-    }
-}
-
-impl Default for QuickBencher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 #[derive(Clone, Copy, Debug)]
 pub enum Throughput {
@@ -117,203 +45,110 @@ impl Default for BencherConfig {
     }
 }
 
-fn parse_args(args: &mut Args) -> OrchestratorConfig {
-    let iter = args.by_ref();
-    let mut config = OrchestratorConfig::default();
-
-    // Skip first arg, which is the binary name
-    if iter.next().is_none() {
-        return config;
-    }
-
-    // Then '--' (at least when invoked from cargo bench)
-    if iter.next().is_none() {
-        return config;
-    }
-
-    loop {
-        let Some(arg) = iter.next() else {
-            break;
-        };
-
-        if arg == "--" {
-            break;
-        }
-
-        if arg == "--bench" {
-            continue;
-        }
-
-        if let Some(long_arg) = arg.strip_prefix("--") {
-            let (key_str, value_str) = if long_arg.contains("=") {
-                // The arg is key=value
-                let mut split = long_arg.splitn(2, '=');
-                (
-                    Cow::Borrowed(split.next().unwrap()),
-                    Cow::Borrowed(split.next().unwrap()),
-                )
-            } else {
-                // The value is on the next arg
-                let key_str = long_arg;
-                let value_str = iter.next().unwrap();
-                (Cow::Borrowed(key_str), Cow::Owned(value_str))
-            };
-
-            if key_str == "num-samples" {
-                config.bencher_config.num_samples = value_str.parse::<usize>().unwrap();
-            } else if key_str == "iter-per-sample" {
-                config.bencher_config.iter_per_sample = value_str.parse::<usize>().unwrap();
-            } else if key_str == "warmup-samples" {
-                config.bencher_config.warmup_samples = value_str.parse::<usize>().unwrap();
-            } else {
-                println!("Unknown argument: {arg}");
-            }
-        } else {
-            config.filter = Some(regex::Regex::new(&arg).unwrap());
-        }
-    }
-
-    config
+#[derive(Debug)]
+pub struct Statistics<Extra = ()> {
+    pub wall_time: WallTimeStats,
+    pub extra: Extra,
 }
 
-#[derive(Clone, Ord, PartialOrd, Eq, PartialEq)]
-struct Sample {
-    duration: Duration,
-}
-
-struct SampleStats {
-    num_outliers: usize,
-    min: Duration,
-    max: Duration,
-    avg: Duration,
-    std_dev: Duration,
-    throughput: Option<f64>,
-}
-
-impl SampleStats {
-    fn compute(samples: &[Sample], iter_per_sample: usize, throughput: Option<Throughput>) -> Self {
-        let (mut inliers, outliers) = split_outliers(samples);
-
-        let mut sum = inliers[0].duration;
-        let mut min = inliers[0].duration;
-        let mut max = inliers[0].duration;
-        for (i, stat) in inliers[1..].iter().enumerate() {
-            if let Some(s) = sum.checked_add(stat.duration) {
-                sum = s;
-            } else {
-                inliers.truncate(i + 1);
-                println!(
-                    "Warning: overflow in samples, ignoring sample above {}",
-                    i + 1
-                );
-                break;
-            }
-            max = max.max(stat.duration);
-            min = min.min(stat.duration);
-        }
-        let sampled_average = sum / inliers.len() as u32;
-        let sampled_average_nano = sampled_average.as_nanos() as i128;
-
-        let variance_nano = if inliers.len() <= 1 {
-            0
-        } else {
-            inliers
-                .iter()
-                .map(|stat| {
-                    let deviation = (stat.duration.as_nanos() as i128) - sampled_average_nano;
-                    deviation * deviation
-                })
-                .sum::<i128>()
-                / (inliers.len() as i128 - 1)
-        };
-
-        let stddev = Duration::from_nanos(variance_nano.isqrt() as u64);
-
-        let average = sampled_average / iter_per_sample as u32;
-        min /= iter_per_sample as u32;
-        max /= iter_per_sample as u32;
-
-        let throughput = throughput.map(|t| match t {
-            Throughput::Elements(n) => {
-                let total = n * iter_per_sample as u64 * inliers.len() as u64;
-                let elem_per_secs = total as f64 / sum.as_secs_f64();
-                elem_per_secs
-            }
-        });
-
-        Self {
-            num_outliers: outliers.len(),
-            min,
-            max,
-            avg: average,
-            std_dev: stddev,
-            throughput,
-        }
-    }
-}
-
-pub struct Bencher {
+pub struct GenericBencher<M: Metric = NoExtraMetric> {
     config: BencherConfig,
-    samples: Vec<Sample>,
+    wall_time_samples: Vec<WallTimeSample>,
+    extra_samples: M::SampleCollection,
     throughput: Option<Throughput>,
 }
 
-impl Bencher {
+impl<M> GenericBencher<M>
+where
+    M: Metric,
+{
     pub fn new(config: BencherConfig) -> Self {
-        let stats = Vec::with_capacity(config.num_samples);
         Self {
             config,
-            samples: stats,
+            wall_time_samples: vec![],
+            extra_samples: M::SampleCollection::new(),
             throughput: None,
         }
-    }
-
-    pub fn config(&self) -> &BencherConfig {
-        &self.config
-    }
-
-    pub fn config_mut(&mut self) -> &mut BencherConfig {
-        &mut self.config
     }
 
     pub fn throughput(&mut self, throughput: Throughput) {
         self.throughput = Some(throughput);
     }
 
-    pub fn bench<F, O>(&mut self, f: F)
+    // pub fn change_measurement<T>(&self) -> GenericBencher<T>
+    // where
+    //     T: Metric,
+    // {
+    //     GenericBencher {
+    //         config: self.config,
+    //         samples: T::SampleCollection::new(),
+    //         throughput: self.throughput,
+    //     }
+    // }
+
+    pub fn bench<F, O>(&mut self, f: F) -> Option<Statistics<M::Statistics>>
     where
         F: Fn() -> O,
     {
         if self.config.num_samples == 0 {
-            return;
+            return None;
         }
 
-        self.samples.clear();
+        self.extra_samples.clear();
+        self.wall_time_samples.clear();
         let mut outputs = Vec::with_capacity(self.config.iter_per_sample);
         for _ in 0..self.config.warmup_samples {
-            let _ = sample_time(&f, self.config.iter_per_sample as u64, &mut outputs);
+            self.sample(&f, self.config.iter_per_sample as u64, &mut outputs);
             outputs.clear();
         }
+        self.wall_time_samples.clear();
+        self.extra_samples.clear();
+        self.extra_samples.ensure_capacity(self.config.num_samples);
+        self.wall_time_samples
+            .ensure_capacity(self.config.num_samples);
 
         for _ in 0..self.config.num_samples {
-            let duration = sample_time(&f, self.config.iter_per_sample as u64, &mut outputs);
+            self.sample(&f, self.config.iter_per_sample as u64, &mut outputs);
             outputs.clear();
-            self.samples.push(Sample { duration });
         }
 
-        self.compute_and_print_stats();
+        let wt_stats = WallTimeStats::compute(
+            &self.wall_time_samples,
+            self.config.iter_per_sample as usize,
+            self.throughput,
+        );
+        WallTime::print_stats(&wt_stats);
+
+        let extra_stats = M::compute_statistics(
+            &self.extra_samples,
+            &self.wall_time_samples,
+            self.config.iter_per_sample as u64,
+        );
+        M::print_stats(&extra_stats);
+        println!();
+
+        Some(Statistics {
+            wall_time: wt_stats,
+            extra: extra_stats,
+        })
     }
 
-    pub fn bench_with_inputs<G, F, I, R>(&mut self, input_gen: G, f: F)
+    pub fn bench_with_inputs<G, F, I, R>(
+        &mut self,
+        input_gen: G,
+        f: F,
+    ) -> Option<Statistics<M::Statistics>>
     where
         G: Fn() -> I,
         F: Fn(I) -> R,
     {
         if self.config.num_samples == 0 {
-            return;
+            return None;
         }
 
-        self.samples.clear();
+        self.extra_samples.clear();
+        self.wall_time_samples.clear();
+
         let mut inputs = Vec::with_capacity(self.config.iter_per_sample);
         let mut outputs = Vec::with_capacity(self.config.iter_per_sample);
 
@@ -321,43 +156,83 @@ impl Bencher {
             for _ in 0..self.config.iter_per_sample {
                 inputs.push(input_gen());
             }
-            let _ = sample_time_with_inputs(&f, &mut inputs, &mut outputs);
+            let _ = self.sample_time_with_inputs(&f, &mut inputs, &mut outputs);
             outputs.clear();
+            self.extra_samples.clear();
+            self.wall_time_samples.clear();
         }
+        self.wall_time_samples.clear();
+        self.extra_samples.clear();
+        self.extra_samples.ensure_capacity(self.config.num_samples);
+        self.wall_time_samples
+            .ensure_capacity(self.config.num_samples);
 
         for _ in 0..self.config.num_samples {
             for _ in 0..self.config.iter_per_sample {
                 inputs.push(input_gen());
             }
-            let duration = sample_time_with_inputs(&f, &mut inputs, &mut outputs);
-            self.samples.push(Sample { duration });
+            self.sample_time_with_inputs(&f, &mut inputs, &mut outputs);
             outputs.clear();
         }
 
-        self.compute_and_print_stats();
-    }
-
-    fn compute_and_print_stats(&self) {
-        let SampleStats {
-            num_outliers: outliers,
-            min,
-            max,
-            avg,
-            std_dev: stddev,
-            throughput,
-        } = SampleStats::compute(
-            self.samples.as_slice(),
-            self.config.iter_per_sample,
+        let wt_stats = WallTimeStats::compute(
+            &self.wall_time_samples,
+            self.config.iter_per_sample as usize,
             self.throughput,
         );
-        println!("\tSamples: {}, Outliers: {}", self.samples.len(), outliers);
-        println!("\tAverage: {avg:?}, min: {min:?}, max: {max:?}, stddev: {stddev:?}");
-        if let Some(t) = throughput {
-            println!("\tThroughput: {t} e/s");
+        WallTime::print_stats(&wt_stats);
+
+        let extra_stats = M::compute_statistics(
+            &self.extra_samples,
+            &self.wall_time_samples,
+            self.config.iter_per_sample as u64,
+        );
+        M::print_stats(&extra_stats);
+
+        Some(Statistics {
+            wall_time: wt_stats,
+            extra: extra_stats,
+        })
+    }
+
+    #[inline]
+    fn sample<F, O>(&mut self, f: &F, iters_per_sample: u64, outputs: &mut Vec<O>)
+    where
+        F: Fn() -> O,
+    {
+        let wt_start = WallTime::start();
+        let extra_start = M::start();
+        for _ in 0..iters_per_sample {
+            let o = f();
+            outputs.push(o);
         }
-        println!();
+        let wt_sample = WallTime::end(&wt_start);
+        let extra_sample = M::end(&extra_start);
+
+        self.extra_samples.push(extra_sample);
+        self.wall_time_samples.push(wt_sample);
+    }
+
+    #[inline]
+    fn sample_time_with_inputs<I, O, F>(&mut self, f: &F, inputs: &mut Vec<I>, outputs: &mut Vec<O>)
+    where
+        F: Fn(I) -> O,
+    {
+        let wt_start = WallTime::start();
+        let extra_start = M::start();
+        for input in inputs.drain(..) {
+            let o = f(input);
+            outputs.push(o);
+        }
+        let wt_sample = WallTime::end(&wt_start);
+        let extra_sample = M::end(&extra_start);
+
+        self.extra_samples.push(extra_sample);
+        self.wall_time_samples.push(wt_sample);
     }
 }
+
+pub type Bencher = GenericBencher<NoExtraMetric>;
 
 pub type BoxedBench = Box<dyn FnMut(&'_ mut Bencher)>;
 
@@ -445,38 +320,41 @@ impl Default for BenchStore {
     }
 }
 
-pub struct Runner {
+pub struct Runner<M = NoExtraMetric>
+where
+    M: Metric,
+{
     filter: Option<regex::Regex>,
     default_config: BencherConfig,
-    bencher: Bencher,
+    bencher: GenericBencher<M>,
 }
 
-impl Runner {
+impl<M> Runner<M>
+where
+    M: Metric,
+{
     pub fn new() -> Self {
         let default_config = BencherConfig::default();
         Self {
             filter: None,
-            bencher: Bencher::new(default_config),
+            bencher: GenericBencher::new(default_config),
             default_config,
         }
     }
 
-    pub fn setup_from_cmdline() -> Self {
+    pub fn setup_from_cmdline(self) -> Self {
         let mut args = std::env::args();
-        Self::setup_from_args(&mut args)
+        self.setup_from_args(&mut args)
     }
 
-    pub fn setup_from_args(args: &mut Args) -> Self {
+    pub fn setup_from_args(mut self, args: &mut Args) -> Self {
         let config = parse_args(args);
-
-        Self {
-            filter: config.filter,
-            bencher: Bencher::new(config.bencher_config),
-            default_config: config.bencher_config,
-        }
+        self.filter = config.filter;
+        self.default_config = config.bencher_config;
+        self
     }
 
-    pub fn run(&mut self, id: &str, mut callback: impl FnMut(&mut Bencher)) {
+    pub fn run(&mut self, id: &str, mut callback: impl FnMut(&mut GenericBencher<M>)) {
         let should_run = self.filter.as_ref().is_none_or(|regex| regex.is_match(id));
 
         if should_run {
@@ -487,52 +365,463 @@ impl Runner {
             println!("{id}: Skipped");
         }
     }
+
+    pub fn run_with<B, A>(&mut self, mut benchable: B, args_iter: impl IntoIterator<Item = A>)
+    where
+        B: Benchable<A, M>,
+    {
+        let mut id = String::new();
+        for args in args_iter {
+            benchable.write_name(&args, &mut id);
+            let should_run = self.filter.as_ref().is_none_or(|regex| regex.is_match(&id));
+
+            if should_run {
+                println!("{id} : Running");
+                self.bencher.config = self.default_config;
+                benchable.execute(&mut self.bencher, args);
+            } else {
+                println!("{id}: Skipped");
+            }
+            id.clear();
+        }
+    }
+}
+
+pub trait Benchable<A, M>
+where
+    M: Metric,
+{
+    fn write_name(&self, args: &A, name: &mut String);
+
+    fn execute(&mut self, bencher: &mut GenericBencher<M>, args: A);
+}
+
+impl<F, A, M> Benchable<A, M> for (&str, F)
+where
+    F: Fn(&mut GenericBencher<M>, A),
+    A: std::fmt::Debug + 'static,
+    M: Metric,
+{
+    fn write_name(&self, args: &A, name: &mut String) {
+        use std::any::TypeId;
+        if TypeId::of::<A>() == TypeId::of::<()>() {
+            write!(name, "{}", self.0).unwrap();
+        } else {
+            write!(name, "{}({args:?})", self.0).unwrap();
+        }
+    }
+
+    fn execute(&mut self, bencher: &mut GenericBencher<M>, args: A) {
+        self.1(bencher, args);
+    }
 }
 
 impl Default for Runner {
+    fn default() -> Self {
+        Runner::<NoExtraMetric>::new()
+    }
+}
+
+fn ensure_vec_capacity<T>(vec: &mut Vec<T>, cap: usize) {
+    if cap > vec.capacity() {
+        vec.reserve(cap - vec.capacity());
+    }
+}
+
+pub trait SampleCollection: Sized {
+    type Sample;
+
+    fn clear(&mut self);
+
+    fn new() -> Self;
+
+    fn ensure_capacity(&mut self, cap: usize);
+
+    fn push(&mut self, value: Self::Sample);
+}
+
+impl<T> SampleCollection for Vec<T> {
+    type Sample = T;
+
+    fn clear(&mut self) {
+        self.clear();
+    }
+
+    fn new() -> Self {
+        Self::new()
+    }
+
+    fn ensure_capacity(&mut self, cap: usize) {
+        ensure_vec_capacity(self, cap);
+    }
+
+    fn push(&mut self, value: Self::Sample) {
+        self.push(value);
+    }
+}
+
+pub trait Metric {
+    type Begin;
+    type Sample;
+    type SampleCollection: SampleCollection<Sample = Self::Sample>;
+
+    type Statistics;
+
+    fn start() -> Self::Begin;
+
+    fn end(intermediate: &Self::Begin) -> Self::Sample;
+
+    fn compute_statistics(
+        samples: &Self::SampleCollection,
+        wall_time_samples: &Vec<WallTimeSample>,
+        iters_per_sample: u64,
+    ) -> Self::Statistics;
+
+    fn print_stats(stats: &Self::Statistics);
+}
+
+pub struct MultiSample2<A, B>
+where
+    A: Metric,
+    B: Metric,
+{
+    a: A::SampleCollection,
+    b: B::SampleCollection,
+}
+
+impl<A, B> SampleCollection for MultiSample2<A, B>
+where
+    A: Metric,
+    B: Metric,
+{
+    type Sample = (A::Sample, B::Sample);
+
+    fn clear(&mut self) {
+        self.a.clear();
+        self.b.clear();
+    }
+
+    fn new() -> Self {
+        Self {
+            a: A::SampleCollection::new(),
+            b: B::SampleCollection::new(),
+        }
+    }
+
+    fn push(&mut self, (a, b): Self::Sample) {
+        self.a.push(a);
+        self.b.push(b);
+    }
+
+    fn ensure_capacity(&mut self, cap: usize) {
+        self.a.ensure_capacity(cap);
+        self.b.ensure_capacity(cap);
+    }
+}
+
+impl<A, B> Default for MultiSample2<A, B>
+where
+    A: Metric,
+    B: Metric,
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[inline]
-fn sample_time<F, O>(f: &F, iters_per_sample: u64, outputs: &mut Vec<O>) -> Duration
+impl<A, B> Metric for (A, B)
 where
-    F: Fn() -> O,
+    A: Metric,
+    B: Metric,
 {
-    let now = std::time::Instant::now();
-    for _ in 0..iters_per_sample {
-        let o = f();
-        outputs.push(o);
+    type Begin = (A::Begin, B::Begin);
+
+    type Sample = (A::Sample, B::Sample);
+
+    type SampleCollection = MultiSample2<A, B>;
+
+    type Statistics = (A::Statistics, B::Statistics);
+
+    fn start() -> Self::Begin {
+        (A::start(), B::start())
     }
-    now.elapsed()
+
+    fn end(intermediate: &Self::Begin) -> Self::Sample {
+        (A::end(&intermediate.0), B::end(&intermediate.1))
+    }
+
+    fn compute_statistics(
+        samples: &Self::SampleCollection,
+        wt_stats: &Vec<WallTimeSample>,
+        iters_per_sample: u64,
+    ) -> Self::Statistics {
+        (
+            A::compute_statistics(&samples.a, wt_stats, iters_per_sample),
+            B::compute_statistics(&samples.b, wt_stats, iters_per_sample),
+        )
+    }
+
+    fn print_stats((a, b): &Self::Statistics) {
+        A::print_stats(a);
+        B::print_stats(b);
+    }
 }
 
-#[inline]
-fn sample_time_with_inputs<I, O, F>(f: &F, inputs: &mut Vec<I>, outputs: &mut Vec<O>) -> Duration
-where
-    F: Fn(I) -> O,
-{
-    let now = std::time::Instant::now();
-    for input in inputs.drain(..) {
-        let o = f(input);
-        outputs.push(o);
+pub struct NoExtraMetric;
+pub struct NaughtCollection;
+
+impl SampleCollection for NaughtCollection {
+    type Sample = ();
+
+    fn clear(&mut self) {
+        ()
     }
-    now.elapsed()
+
+    fn new() -> Self {
+        NaughtCollection
+    }
+
+    fn ensure_capacity(&mut self, _cap: usize) {
+        ()
+    }
+
+    fn push(&mut self, _value: Self::Sample) {
+        ()
+    }
 }
 
-fn split_outliers(input: &[Sample]) -> (Vec<Sample>, Vec<Sample>) {
+impl Metric for NoExtraMetric {
+    type Begin = ();
+
+    type Sample = ();
+
+    type SampleCollection = NaughtCollection;
+
+    type Statistics = ();
+
+    fn start() -> Self::Begin {
+        ()
+    }
+
+    fn end(_intermediate: &Self::Begin) -> Self::Sample {
+        ()
+    }
+
+    fn compute_statistics(
+        _samples: &Self::SampleCollection,
+        _wt_samples: &Vec<WallTimeSample>,
+        _iters_per_sample: u64,
+    ) -> Self::Statistics {
+        ()
+    }
+
+    fn print_stats(_stats: &Self::Statistics) {
+        ()
+    }
+}
+
+mod wall_time {
+    use std::{
+        ops::{Add, Div, Sub},
+        time::Duration,
+    };
+
+    use crate::{Metric, SaturatingSub, Throughput};
+
+    #[derive(Clone, Copy, Ord, PartialOrd, Eq, PartialEq, Debug)]
+    pub struct WallTimeSample {
+        pub(crate) duration: Duration,
+    }
+
+    impl Add<Self> for WallTimeSample {
+        type Output = Self;
+
+        fn add(self, rhs: Self) -> Self::Output {
+            Self {
+                duration: self.duration + rhs.duration,
+            }
+        }
+    }
+
+    impl Sub<Self> for WallTimeSample {
+        type Output = Self;
+
+        fn sub(self, rhs: Self) -> Self::Output {
+            Self {
+                duration: self.duration - rhs.duration,
+            }
+        }
+    }
+
+    impl SaturatingSub<Self> for WallTimeSample {
+        type Output = Self;
+
+        fn saturating_sub(self, rhs: Self) -> Self::Output {
+            Self {
+                duration: self.duration.saturating_sub(rhs.duration),
+            }
+        }
+    }
+
+    impl Div<u32> for WallTimeSample {
+        type Output = Self;
+
+        fn div(self, rhs: u32) -> Self::Output {
+            Self {
+                duration: self.duration / rhs,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct WallTimeStats {
+        pub(crate) num_outliers: usize,
+        pub(crate) min: Duration,
+        pub(crate) max: Duration,
+        pub(crate) avg: Duration,
+        pub(crate) std_dev: Duration,
+        pub(crate) throughput: Option<f64>,
+    }
+
+    impl WallTimeStats {
+        pub(crate) fn compute(
+            samples: &[WallTimeSample],
+            iter_per_sample: usize,
+            throughput: Option<Throughput>,
+        ) -> Self {
+            // TODO: remove to_vec
+            let (mut inliers, outliers) = super::split_outliers(samples.to_vec());
+
+            let mut sum = inliers[0].duration;
+            let mut min = inliers[0].duration;
+            let mut max = inliers[0].duration;
+            for (i, stat) in inliers[1..].iter().enumerate() {
+                if let Some(s) = sum.checked_add(stat.duration) {
+                    sum = s;
+                } else {
+                    inliers.truncate(i + 1);
+                    println!(
+                        "Warning: overflow in samples, ignoring sample above {}",
+                        i + 1
+                    );
+                    break;
+                }
+                max = max.max(stat.duration);
+                min = min.min(stat.duration);
+            }
+            let sampled_average = sum / inliers.len() as u32;
+            let sampled_average_nano = sampled_average.as_nanos() as i128;
+
+            let variance_nano = if inliers.len() <= 1 {
+                0
+            } else {
+                inliers
+                    .iter()
+                    .map(|stat| {
+                        let deviation = (stat.duration.as_nanos() as i128) - sampled_average_nano;
+                        deviation * deviation
+                    })
+                    .sum::<i128>()
+                    / (inliers.len() as i128 - 1)
+            };
+
+            let stddev = Duration::from_nanos(variance_nano.isqrt() as u64);
+
+            let average = sampled_average / iter_per_sample as u32;
+            min /= iter_per_sample as u32;
+            max /= iter_per_sample as u32;
+
+            let throughput = throughput.map(|t| match t {
+                Throughput::Elements(n) => {
+                    let total = n * iter_per_sample as u64 * inliers.len() as u64;
+                    let elem_per_secs = total as f64 / sum.as_secs_f64();
+                    elem_per_secs
+                }
+            });
+
+            Self {
+                num_outliers: outliers.len(),
+                min,
+                max,
+                avg: average,
+                std_dev: stddev,
+                throughput,
+            }
+        }
+    }
+
+    pub struct WallTime;
+
+    impl Metric for WallTime {
+        type Begin = std::time::Instant;
+        type Sample = WallTimeSample;
+        type SampleCollection = Vec<Self::Sample>;
+        type Statistics = WallTimeStats;
+
+        fn start() -> Self::Begin {
+            std::time::Instant::now()
+        }
+
+        fn end(intermediate: &Self::Begin) -> Self::Sample {
+            WallTimeSample {
+                duration: intermediate.elapsed(),
+            }
+        }
+
+        fn compute_statistics(
+            samples: &Self::SampleCollection,
+            _wt_samples: &Vec<WallTimeSample>,
+            iters_per_sample: u64,
+        ) -> Self::Statistics {
+            WallTimeStats::compute(samples, iters_per_sample as usize, None)
+        }
+
+        fn print_stats(stats: &Self::Statistics) {
+            let WallTimeStats {
+                num_outliers: _outliers,
+                min,
+                max,
+                avg,
+                std_dev: stddev,
+                throughput,
+            } = stats;
+            // println!("\tSamples: {}, Outliers: {}", stats.samples.len(), outliers);
+            println!(
+                "\tWallTime: Average: {avg:?}, min: {min:?}, max: {max:?}, stddev: {stddev:?}"
+            );
+            if let Some(t) = throughput {
+                println!("\tThroughput: {t} e/s");
+            }
+        }
+    }
+}
+
+trait SaturatingSub<Rhs = Self> {
+    type Output;
+
+    fn saturating_sub(self, rhs: Rhs) -> Self::Output;
+}
+
+fn split_outliers<T>(input: Vec<T>) -> (Vec<T>, Vec<T>)
+where
+    T: Copy
+        + Ord
+        + Add<T, Output = T>
+        + Sub<T, Output = T>
+        + SaturatingSub<T, Output = T>
+        + Div<u32, Output = T>,
+{
     if input.len() < 4 {
-        return (input.to_vec(), vec![]);
+        return (input, vec![]);
     }
 
-    let mut sorted = input.to_vec();
+    let mut sorted = input;
     sorted.sort();
 
     let q1_idx = sorted.len() / 4;
     let q3_idx = (3 * sorted.len()) / 4;
-    let q1 = sorted[q1_idx].duration;
-    let q3 = sorted[q3_idx].duration;
+    let q1 = sorted[q1_idx];
+    let q3 = sorted[q3_idx];
     let iqr = q3 - q1;
 
     let step = iqr + iqr / 2; // 1.5 * IQR
@@ -542,7 +831,7 @@ fn split_outliers(input: &[Sample]) -> (Vec<Sample>, Vec<Sample>) {
     let mut outliers = vec![];
     let mut inliers = vec![];
     for stat in sorted {
-        if stat.duration < lower_bound || stat.duration > upper_bound {
+        if stat < lower_bound || stat > upper_bound {
             outliers.push(stat);
         } else {
             inliers.push(stat);
@@ -550,4 +839,176 @@ fn split_outliers(input: &[Sample]) -> (Vec<Sample>, Vec<Sample>) {
     }
 
     (inliers, outliers)
+}
+
+fn split_outliers_by_index<T>(input: &[T]) -> (Vec<usize>, Vec<usize>)
+where
+    T: Copy
+        + Ord
+        + Add<T, Output = T>
+        + Sub<T, Output = T>
+        + SaturatingSub<T, Output = T>
+        + Div<u32, Output = T>,
+{
+    if input.len() < 4 {
+        return (vec![0, 1, 2, 3], vec![]);
+    }
+
+    let mut sorted = input.to_vec();
+    sorted.sort();
+
+    let q1_idx = sorted.len() / 4;
+    let q3_idx = (3 * sorted.len()) / 4;
+    let q1 = sorted[q1_idx];
+    let q3 = sorted[q3_idx];
+    let iqr = q3 - q1;
+
+    let step = iqr + iqr / 2; // 1.5 * IQR
+    let lower_bound = q1.saturating_sub(step); // Q1 - 1.5*IQR
+    let upper_bound = q3 + step; // Q3 + 1.5*IQR
+
+    let mut outliers = vec![];
+    let mut inliers = vec![];
+    for stat in sorted {
+        let index = input.iter().position(|&v| v == stat).unwrap();
+        if stat < lower_bound || stat > upper_bound {
+            outliers.push(index);
+        } else {
+            inliers.push(index);
+        }
+    }
+
+    (inliers, outliers)
+}
+#[cfg(feature = "libc")]
+pub mod cpu_time {
+    use std::{
+        mem::MaybeUninit,
+        ops::{Add, Div, Sub},
+        time::Duration,
+    };
+
+    use libc::timespec;
+
+    use crate::{Metric, SaturatingSub};
+
+    pub struct CpuLoadStatistics {
+        pub mean_percent: f64,
+    }
+
+    pub struct CpuTimeInstant(timespec);
+
+    impl CpuTimeInstant {
+        pub fn now() -> Self {
+            let inner = unsafe {
+                let mut tp = MaybeUninit::<timespec>::uninit();
+                let r = libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, tp.as_mut_ptr());
+                assert_eq!(r, 0);
+                tp.assume_init()
+            };
+
+            Self(inner)
+        }
+
+        pub fn elapsed(&self) -> CpuTimeDuration {
+            let now = Self::now();
+
+            let sec = now.0.tv_sec - self.0.tv_sec;
+            let nsec = now.0.tv_nsec - self.0.tv_nsec;
+
+            CpuTimeDuration(Duration::new(sec as u64, nsec as u32))
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, Ord, PartialOrd, PartialEq, Eq)]
+    pub struct CpuTimeDuration(Duration);
+
+    impl Add<Self> for CpuTimeDuration {
+        type Output = Self;
+
+        fn add(self, rhs: Self) -> Self::Output {
+            Self(self.0 + rhs.0)
+        }
+    }
+
+    impl Sub<Self> for CpuTimeDuration {
+        type Output = Self;
+
+        fn sub(self, rhs: Self) -> Self::Output {
+            Self(self.0 - rhs.0)
+        }
+    }
+
+    impl SaturatingSub<Self> for CpuTimeDuration {
+        type Output = Self;
+
+        fn saturating_sub(self, rhs: Self) -> Self::Output {
+            Self(self.0.saturating_sub(rhs.0))
+        }
+    }
+
+    impl Div<u32> for CpuTimeDuration {
+        type Output = Self;
+
+        fn div(self, rhs: u32) -> Self::Output {
+            Self(self.0 / rhs)
+        }
+    }
+
+    impl CpuTimeDuration {
+        pub fn percent(&self, thread_count: usize, wall_time: Duration) -> f64 {
+            let mut elapsed = self.0.as_nanos() as f64;
+            elapsed /= wall_time.as_nanos() as f64;
+            elapsed /= thread_count as f64;
+            elapsed * 100.0
+        }
+    }
+
+    pub struct CpuLoad;
+
+    impl Metric for CpuLoad {
+        type Begin = CpuTimeInstant;
+
+        type Sample = CpuTimeDuration;
+
+        type SampleCollection = Vec<Self::Sample>;
+
+        type Statistics = CpuLoadStatistics;
+
+        fn start() -> Self::Begin {
+            CpuTimeInstant::now()
+        }
+
+        fn end(intermediate: &Self::Begin) -> Self::Sample {
+            intermediate.elapsed()
+        }
+
+        fn compute_statistics(
+            samples: &Self::SampleCollection,
+            wall_time_samples: &Vec<crate::wall_time::WallTimeSample>,
+            _iters_per_sample: u64,
+        ) -> Self::Statistics {
+            let threads = std::thread::available_parallelism()
+                .expect("Failed to get CPU threads")
+                .get();
+
+            let (inliers, _outliers) = super::split_outliers_by_index(&samples);
+
+            let mut sum = 0.0;
+            for index in inliers {
+                let sample = samples[index];
+                let wall_time = wall_time_samples[index];
+                let p = sample.percent(threads, wall_time.duration);
+                sum += p;
+            }
+
+            CpuLoadStatistics {
+                mean_percent: sum / (wall_time_samples.len() as f64),
+            }
+        }
+
+        fn print_stats(stats: &Self::Statistics) {
+            println!("\tCpuLoad: {:.03}%", stats.mean_percent);
+        }
+    }
 }

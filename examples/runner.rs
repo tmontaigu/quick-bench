@@ -1,4 +1,4 @@
-use quick_bench::{Runner, Throughput};
+use quick_bench::{NoExtraMetric, Runner, Throughput};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
@@ -62,8 +62,25 @@ impl Drop for LargeDrop {
     }
 }
 
+fn work() {
+    let mut d = 0;
+    for n in 0..100_000 {
+        for m in 0..100_000 {
+            d = black_box(d * n * m);
+        }
+    }
+}
+
 fn main() {
-    let mut runner = Runner::setup_from_cmdline();
+    let load = quick_bench::cpu_time::CpuTimeInstant::now();
+    let t = std::time::Instant::now();
+    // keep_cpu_busy(Duration::from_secs(1));
+    rayon::broadcast(|_| work());
+
+    let pct = load.elapsed().percent(12, t.elapsed());
+    println!("CPU usage: {pct} %");
+
+    let mut runner = Runner::default().setup_from_cmdline();
 
     runner.run("fibonacci_recursive_match", |bencher| {
         bencher.bench(|| {
@@ -77,9 +94,12 @@ fn main() {
     });
     runner.run("fibonacci_iterative", |bencher| {
         keep_cpu_busy(Duration::from_secs(5));
-        bencher.bench(|| {
-            fibonacci_iterative(black_box(20));
-        });
+        let s = bencher
+            .bench(|| {
+                fibonacci_iterative(black_box(20));
+            })
+            .unwrap();
+        println!("s: {s:?}");
     });
     runner.run("Vec::sort", |bencher| {
         keep_cpu_busy(Duration::from_secs(5));
