@@ -5,7 +5,7 @@ use std::ops::{Add, Div, Sub};
 use std::time::{Duration, Instant};
 
 use crate::util::parse_args;
-use crate::wall_time::{WallTime, WallTimeSample, WallTimeStats};
+use crate::wall_time::{WallTimeInstant, WallTimeSample, WallTimeStats};
 
 mod quick;
 mod util;
@@ -22,7 +22,7 @@ pub struct OrchestratorConfig {
 // * Use time for warmup, i.e., warmup for x seconds
 //   to allow user to then parse its own args. (or use `--` as separator)
 // * override bencher settings
-// * write measurements to file;
+// * write measurements to file to be able to print some diff
 
 #[derive(Clone, Copy, Debug)]
 pub enum Throughput {
@@ -80,7 +80,7 @@ impl BenchMode {
     }
 }
 
-pub struct GenericBencher<M: Metric = NoExtraMetric> {
+pub struct GenericBencher<M: ExtraMetric = NoExtraMetric> {
     pub config: BencherConfig,
     wall_time_samples: Vec<WallTimeSample>,
     extra_samples: M::SampleCollection,
@@ -89,7 +89,7 @@ pub struct GenericBencher<M: Metric = NoExtraMetric> {
 
 impl<M> GenericBencher<M>
 where
-    M: Metric,
+    M: ExtraMetric,
 {
     pub fn new(config: BencherConfig) -> Self {
         Self {
@@ -228,13 +228,13 @@ where
     where
         F: Fn(I) -> O,
     {
-        let wt_start = WallTime::start();
+        let wt_start = WallTimeInstant::now();
         let extra_start = M::start();
         for input in inputs.drain(..) {
             let o = f(input);
             outputs.push(o);
         }
-        let wt_sample = WallTime::end(&wt_start);
+        let wt_sample = wt_start.elapsed();
         let extra_sample = M::end(&extra_start);
 
         self.extra_samples.push(extra_sample);
@@ -263,7 +263,7 @@ where
 
     fn print_stats(&self, stats: &Statistics<M::Statistics>, total_elapsed: Duration) {
         println!("\tRunning time: {total_elapsed:?}");
-        WallTime::print_stats(&stats.wall_time);
+        stats.wall_time.print_stats();
         M::print_stats(&stats.extra);
         println!();
     }
@@ -359,7 +359,7 @@ impl Default for BenchStore {
 
 pub struct Runner<M = NoExtraMetric>
 where
-    M: Metric,
+    M: ExtraMetric,
 {
     filter: Option<regex::Regex>,
     default_config: BencherConfig,
@@ -368,7 +368,7 @@ where
 
 impl<M> Runner<M>
 where
-    M: Metric,
+    M: ExtraMetric,
 {
     pub fn new() -> Self {
         let default_config = BencherConfig::default();
@@ -426,7 +426,7 @@ where
 
 pub trait Benchable<A, M>
 where
-    M: Metric,
+    M: ExtraMetric,
 {
     fn write_name(&self, args: &A, name: &mut String);
 
@@ -437,7 +437,7 @@ impl<F, A, M> Benchable<A, M> for (&str, F)
 where
     F: Fn(&mut GenericBencher<M>, A),
     A: std::fmt::Debug + 'static,
-    M: Metric,
+    M: ExtraMetric,
 {
     fn write_name(&self, args: &A, name: &mut String) {
         use std::any::TypeId;
@@ -497,7 +497,7 @@ impl<T> SampleCollection for Vec<T> {
     }
 }
 
-pub trait Metric {
+pub trait ExtraMetric {
     type Begin;
     type Sample;
     type SampleCollection: SampleCollection<Sample = Self::Sample>;
@@ -510,7 +510,7 @@ pub trait Metric {
 
     fn compute_statistics(
         samples: &Self::SampleCollection,
-        wall_time_samples: &Vec<WallTimeSample>,
+        wall_time_samples: &[WallTimeSample],
         iters_per_sample: u64,
     ) -> Self::Statistics;
 
@@ -519,8 +519,8 @@ pub trait Metric {
 
 pub struct MultiSample2<A, B>
 where
-    A: Metric,
-    B: Metric,
+    A: ExtraMetric,
+    B: ExtraMetric,
 {
     a: A::SampleCollection,
     b: B::SampleCollection,
@@ -528,8 +528,8 @@ where
 
 impl<A, B> SampleCollection for MultiSample2<A, B>
 where
-    A: Metric,
-    B: Metric,
+    A: ExtraMetric,
+    B: ExtraMetric,
 {
     type Sample = (A::Sample, B::Sample);
 
@@ -558,18 +558,18 @@ where
 
 impl<A, B> Default for MultiSample2<A, B>
 where
-    A: Metric,
-    B: Metric,
+    A: ExtraMetric,
+    B: ExtraMetric,
 {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<A, B> Metric for (A, B)
+impl<A, B> ExtraMetric for (A, B)
 where
-    A: Metric,
-    B: Metric,
+    A: ExtraMetric,
+    B: ExtraMetric,
 {
     type Begin = (A::Begin, B::Begin);
 
@@ -589,7 +589,7 @@ where
 
     fn compute_statistics(
         samples: &Self::SampleCollection,
-        wt_stats: &Vec<WallTimeSample>,
+        wt_stats: &[WallTimeSample],
         iters_per_sample: u64,
     ) -> Self::Statistics {
         (
@@ -604,7 +604,7 @@ where
     }
 }
 
-pub struct NoExtraMetric;
+pub type NoExtraMetric = ();
 pub struct NaughtCollection;
 
 impl SampleCollection for NaughtCollection {
@@ -621,7 +621,7 @@ impl SampleCollection for NaughtCollection {
     fn push(&mut self, _value: Self::Sample) {}
 }
 
-impl Metric for NoExtraMetric {
+impl ExtraMetric for NoExtraMetric {
     type Begin = ();
 
     type Sample = ();
@@ -636,7 +636,7 @@ impl Metric for NoExtraMetric {
 
     fn compute_statistics(
         _samples: &Self::SampleCollection,
-        _wt_samples: &Vec<WallTimeSample>,
+        _wt_samples: &[WallTimeSample],
         _iters_per_sample: u64,
     ) -> Self::Statistics {
     }
@@ -647,10 +647,10 @@ impl Metric for NoExtraMetric {
 mod wall_time {
     use std::{
         ops::{Add, Div, Sub},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
-    use crate::{Metric, SaturatingSub, Throughput};
+    use crate::{SaturatingSub, Throughput};
 
     #[derive(Clone, Copy, Ord, PartialOrd, Eq, PartialEq, Debug)]
     pub struct WallTimeSample {
@@ -771,35 +771,8 @@ mod wall_time {
                 throughput,
             }
         }
-    }
 
-    pub struct WallTime;
-
-    impl Metric for WallTime {
-        type Begin = std::time::Instant;
-        type Sample = WallTimeSample;
-        type SampleCollection = Vec<Self::Sample>;
-        type Statistics = WallTimeStats;
-
-        fn start() -> Self::Begin {
-            std::time::Instant::now()
-        }
-
-        fn end(intermediate: &Self::Begin) -> Self::Sample {
-            WallTimeSample {
-                duration: intermediate.elapsed(),
-            }
-        }
-
-        fn compute_statistics(
-            samples: &Self::SampleCollection,
-            _wt_samples: &Vec<WallTimeSample>,
-            iters_per_sample: u64,
-        ) -> Self::Statistics {
-            WallTimeStats::compute(samples, iters_per_sample as usize, None)
-        }
-
-        fn print_stats(stats: &Self::Statistics) {
+        pub fn print_stats(self) {
             let WallTimeStats {
                 num_outliers,
                 min,
@@ -807,7 +780,7 @@ mod wall_time {
                 avg,
                 std_dev: stddev,
                 throughput,
-            } = stats;
+            } = self;
 
             println!("\tWallTime:");
             println!("\t\tOutliers: {}", num_outliers);
@@ -815,6 +788,20 @@ mod wall_time {
 
             if let Some(t) = throughput {
                 println!("\tThroughput: {t} e/s");
+            }
+        }
+    }
+
+    pub struct WallTimeInstant(Instant);
+
+    impl WallTimeInstant {
+        pub fn now() -> Self {
+            Self(Instant::now())
+        }
+
+        pub fn elapsed(&self) -> WallTimeSample {
+            WallTimeSample {
+                duration: self.0.elapsed(),
             }
         }
     }
@@ -914,7 +901,7 @@ pub mod cpu_time {
 
     use libc::timespec;
 
-    use crate::{Metric, SaturatingSub};
+    use crate::{ExtraMetric, SaturatingSub};
 
     pub struct CpuLoadStatistics {
         pub mean_percent: f64,
@@ -990,7 +977,7 @@ pub mod cpu_time {
 
     pub struct CpuLoad;
 
-    impl Metric for CpuLoad {
+    impl ExtraMetric for CpuLoad {
         type Begin = CpuTimeInstant;
 
         type Sample = CpuTimeDuration;
@@ -1009,7 +996,7 @@ pub mod cpu_time {
 
         fn compute_statistics(
             samples: &Self::SampleCollection,
-            wall_time_samples: &Vec<crate::wall_time::WallTimeSample>,
+            wall_time_samples: &[crate::wall_time::WallTimeSample],
             _iters_per_sample: u64,
         ) -> Self::Statistics {
             let threads = std::thread::available_parallelism()

@@ -1,6 +1,6 @@
-use std::{hint::black_box, time::Duration};
+use std::hint::black_box;
 
-use quick_bench::{Bencher, GenericBencher, NoExtraMetric, Runner, cpu_time::CpuLoad};
+use quick_bench::{GenericBencher, Runner, cpu_time::CpuLoad};
 
 fn fibonacci_recursive_if(n: i32) -> i32 {
     if n <= 0 {
@@ -13,8 +13,8 @@ fn fibonacci_recursive_if(n: i32) -> i32 {
 }
 fn work() {
     let mut d = 0;
-    for n in 0..50_000 {
-        for m in 0..50_000 {
+    for n in 0..20_000 {
+        for m in 0..20_000 {
             d = black_box(d * n * m);
         }
     }
