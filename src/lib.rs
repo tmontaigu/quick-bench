@@ -36,6 +36,7 @@ pub struct BencherConfig {
     pub iter_per_sample: usize,
     pub warmup_samples: usize,
     pub time_limit: Option<Duration>,
+    pub min_time: Duration,
 }
 
 impl Default for BencherConfig {
@@ -45,6 +46,7 @@ impl Default for BencherConfig {
             iter_per_sample: 10,
             warmup_samples: 5,
             time_limit: None,
+            min_time: Duration::from_secs(1),
         }
     }
 }
@@ -191,25 +193,33 @@ where
         self.wall_time_samples
             .ensure_capacity(self.config.num_samples);
 
-        let start = Instant::now();
+        let mut total_elapsed = Duration::ZERO;
         for sample_index in 0..self.config.num_samples {
             for _ in 0..iter_per_samples {
                 inputs.push(input_gen());
             }
-            self.sample_time_with_inputs(&f, &mut inputs, &mut outputs);
+            let wt = self.sample_time_with_inputs(&f, &mut inputs, &mut outputs);
             outputs.clear();
+            total_elapsed += wt.duration;
 
             if sample_index != self.config.num_samples - 1 {
-                if start.elapsed() >= time_limit {
+                if total_elapsed >= time_limit {
                     println!(
-                        "Timit limit reached, limit: {time_limit:?}, elapsed: {:?}",
-                        start.elapsed()
+                        "Timit limit reached, limit: {time_limit:?}, elapsed: {total_elapsed:?}"
                     );
                     break;
                 }
             }
         }
-        let total_elapsed = start.elapsed();
+
+        while total_elapsed < self.config.min_time {
+            for _ in 0..iter_per_samples {
+                inputs.push(input_gen());
+            }
+            let wt = self.sample_time_with_inputs(&f, &mut inputs, &mut outputs);
+            outputs.clear();
+            total_elapsed += wt.duration;
+        }
 
         let stats = self.compute_statistics(iter_per_samples as u64);
         self.print_stats(&stats, total_elapsed);
@@ -218,7 +228,12 @@ where
     }
 
     #[inline]
-    fn sample_time_with_inputs<I, O, F>(&mut self, f: &F, inputs: &mut Vec<I>, outputs: &mut Vec<O>)
+    fn sample_time_with_inputs<I, O, F>(
+        &mut self,
+        f: &F,
+        inputs: &mut Vec<I>,
+        outputs: &mut Vec<O>,
+    ) -> WallTimeSample
     where
         F: Fn(I) -> O,
     {
@@ -233,6 +248,8 @@ where
 
         self.extra_samples.push(extra_sample);
         self.wall_time_samples.push(wt_sample);
+
+        wt_sample
     }
 
     fn compute_statistics(&self, iter_per_samples: u64) -> Statistics<M::Statistics> {
