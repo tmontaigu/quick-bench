@@ -197,13 +197,9 @@ where
             outputs.clear();
             total_elapsed += wt.duration;
 
-            if sample_index != self.config.num_samples.get() - 1 {
-                if total_elapsed >= time_limit {
-                    println!(
-                        "Timit limit reached, limit: {time_limit:?}, elapsed: {total_elapsed:?}"
-                    );
-                    break;
-                }
+            if sample_index != self.config.num_samples.get() - 1 && total_elapsed >= time_limit {
+                println!("Timit limit reached, limit: {time_limit:?}, elapsed: {total_elapsed:?}");
+                break;
             }
         }
 
@@ -256,7 +252,7 @@ where
         let extra_stats = M::compute_statistics(
             &self.extra_samples,
             &self.wall_time_samples,
-            iter_per_samples as u64,
+            iter_per_samples,
         );
 
         Statistics {
@@ -614,21 +610,15 @@ pub struct NaughtCollection;
 impl SampleCollection for NaughtCollection {
     type Sample = ();
 
-    fn clear(&mut self) {
-        ()
-    }
+    fn clear(&mut self) {}
 
     fn new() -> Self {
         NaughtCollection
     }
 
-    fn ensure_capacity(&mut self, _cap: usize) {
-        ()
-    }
+    fn ensure_capacity(&mut self, _cap: usize) {}
 
-    fn push(&mut self, _value: Self::Sample) {
-        ()
-    }
+    fn push(&mut self, _value: Self::Sample) {}
 }
 
 impl Metric for NoExtraMetric {
@@ -640,25 +630,18 @@ impl Metric for NoExtraMetric {
 
     type Statistics = ();
 
-    fn start() -> Self::Begin {
-        ()
-    }
+    fn start() -> Self::Begin {}
 
-    fn end(_intermediate: &Self::Begin) -> Self::Sample {
-        ()
-    }
+    fn end(_intermediate: &Self::Begin) -> Self::Sample {}
 
     fn compute_statistics(
         _samples: &Self::SampleCollection,
         _wt_samples: &Vec<WallTimeSample>,
         _iters_per_sample: u64,
     ) -> Self::Statistics {
-        ()
     }
 
-    fn print_stats(_stats: &Self::Statistics) {
-        ()
-    }
+    fn print_stats(_stats: &Self::Statistics) {}
 }
 
 mod wall_time {
@@ -775,8 +758,7 @@ mod wall_time {
             let throughput = throughput.map(|t| match t {
                 Throughput::Elements(n) => {
                     let total = n * iter_per_sample as u64 * inliers.len() as u64;
-                    let elem_per_secs = total as f64 / sum.as_secs_f64();
-                    elem_per_secs
+                    total as f64 / sum.as_secs_f64()
                 }
             });
 
@@ -1034,7 +1016,7 @@ pub mod cpu_time {
                 .expect("Failed to get CPU threads")
                 .get();
 
-            let (inliers, _outliers) = super::split_outliers_by_index(&samples);
+            let (inliers, _outliers) = super::split_outliers_by_index(samples);
 
             let mut sum = 0.0;
             for index in inliers {

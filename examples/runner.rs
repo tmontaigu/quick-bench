@@ -1,4 +1,4 @@
-use quick_bench::{NoExtraMetric, Runner, Throughput};
+use quick_bench::{Runner, Throughput};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
@@ -59,15 +59,6 @@ impl LargeDrop {
 impl Drop for LargeDrop {
     fn drop(&mut self) {
         keep_cpu_busy(self.drop_duration);
-    }
-}
-
-fn work() {
-    let mut d = 0;
-    for n in 0..100_000 {
-        for m in 0..100_000 {
-            d = black_box(d * n * m);
-        }
     }
 }
 
