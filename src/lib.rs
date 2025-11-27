@@ -1,5 +1,6 @@
 use std::env::Args;
 use std::fmt::Write;
+use std::num::NonZero;
 use std::ops::{Add, Div, Sub};
 use std::time::{Duration, Instant};
 
@@ -30,10 +31,8 @@ pub enum Throughput {
 
 #[derive(Copy, Clone, Debug)]
 pub struct BencherConfig {
-    // TODO use NonZero ?
-    pub num_samples: usize,
-    // TODO use NonZero ?
-    pub iter_per_sample: usize,
+    pub num_samples: NonZero<usize>,
+    pub iter_per_sample: NonZero<usize>,
     pub warmup_samples: usize,
     pub time_limit: Option<Duration>,
     pub min_time: Duration,
@@ -42,8 +41,8 @@ pub struct BencherConfig {
 impl Default for BencherConfig {
     fn default() -> Self {
         Self {
-            num_samples: 10,
-            iter_per_sample: 10,
+            num_samples: NonZero::new(10).unwrap(),
+            iter_per_sample: NonZero::new(10).unwrap(),
             warmup_samples: 5,
             time_limit: None,
             min_time: Duration::from_secs(1),
@@ -121,7 +120,7 @@ where
     // }
 
     #[inline(never)]
-    pub fn bench<F, O>(&mut self, f: F) -> Option<Statistics<M::Statistics>>
+    pub fn bench<F, O>(&mut self, f: F) -> Statistics<M::Statistics>
     where
         F: Fn() -> O,
     {
@@ -135,11 +134,7 @@ where
     }
 
     #[inline(never)]
-    pub fn bench_with_inputs<G, F, I, R>(
-        &mut self,
-        input_gen: G,
-        f: F,
-    ) -> Option<Statistics<M::Statistics>>
+    pub fn bench_with_inputs<G, F, I, R>(&mut self, input_gen: G, f: F) -> Statistics<M::Statistics>
     where
         G: Fn() -> I,
         F: Fn(I) -> R,
@@ -152,26 +147,22 @@ where
         &mut self,
         input_gen: G,
         f: F,
-    ) -> Option<Statistics<M::Statistics>>
+    ) -> Statistics<M::Statistics>
     where
         G: Fn() -> I,
         F: Fn(I) -> R,
     {
-        if self.config.num_samples == 0 {
-            return None;
-        }
-
         self.extra_samples.clear();
         self.wall_time_samples.clear();
 
-        let mut inputs = Vec::with_capacity(self.config.iter_per_sample);
-        let mut outputs = Vec::with_capacity(self.config.iter_per_sample);
+        let mut inputs = Vec::with_capacity(self.config.iter_per_sample.get());
+        let mut outputs = Vec::with_capacity(self.config.iter_per_sample.get());
 
         let input = input_gen();
         let (time_limit, iter_per_samples) = match BenchMode::select_with_input(&f, input) {
             BenchMode::Micro => {
                 for _ in 0..self.config.warmup_samples {
-                    for _ in 0..self.config.iter_per_sample {
+                    for _ in 0..self.config.iter_per_sample.get() {
                         inputs.push(input_gen());
                     }
                     let _ = self.sample_time_with_inputs(&f, &mut inputs, &mut outputs);
@@ -185,24 +176,28 @@ where
                     self.config.iter_per_sample,
                 )
             }
-            BenchMode::Macro => (self.config.time_limit.unwrap_or(Duration::from_mins(2)), 1),
+            BenchMode::Macro => (
+                self.config.time_limit.unwrap_or(Duration::from_mins(2)),
+                NonZero::new(1).unwrap(),
+            ),
         };
         self.wall_time_samples.clear();
         self.extra_samples.clear();
-        self.extra_samples.ensure_capacity(self.config.num_samples);
+        self.extra_samples
+            .ensure_capacity(self.config.num_samples.get());
         self.wall_time_samples
-            .ensure_capacity(self.config.num_samples);
+            .ensure_capacity(self.config.num_samples.get());
 
         let mut total_elapsed = Duration::ZERO;
-        for sample_index in 0..self.config.num_samples {
-            for _ in 0..iter_per_samples {
+        for sample_index in 0..self.config.num_samples.get() {
+            for _ in 0..iter_per_samples.get() {
                 inputs.push(input_gen());
             }
             let wt = self.sample_time_with_inputs(&f, &mut inputs, &mut outputs);
             outputs.clear();
             total_elapsed += wt.duration;
 
-            if sample_index != self.config.num_samples - 1 {
+            if sample_index != self.config.num_samples.get() - 1 {
                 if total_elapsed >= time_limit {
                     println!(
                         "Timit limit reached, limit: {time_limit:?}, elapsed: {total_elapsed:?}"
@@ -213,7 +208,7 @@ where
         }
 
         while total_elapsed < self.config.min_time {
-            for _ in 0..iter_per_samples {
+            for _ in 0..iter_per_samples.get() {
                 inputs.push(input_gen());
             }
             let wt = self.sample_time_with_inputs(&f, &mut inputs, &mut outputs);
@@ -221,10 +216,10 @@ where
             total_elapsed += wt.duration;
         }
 
-        let stats = self.compute_statistics(iter_per_samples as u64);
+        let stats = self.compute_statistics(iter_per_samples.get() as u64);
         self.print_stats(&stats, total_elapsed);
 
-        Some(stats)
+        stats
     }
 
     #[inline]

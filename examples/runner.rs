@@ -72,14 +72,6 @@ fn work() {
 }
 
 fn main() {
-    let load = quick_bench::cpu_time::CpuTimeInstant::now();
-    let t = std::time::Instant::now();
-    // keep_cpu_busy(Duration::from_secs(1));
-    rayon::broadcast(|_| work());
-
-    let pct = load.elapsed().percent(12, t.elapsed());
-    println!("CPU usage: {pct} %");
-
     let mut runner = Runner::default().setup_from_cmdline();
 
     runner.run("fibonacci_recursive_match", |bencher| {
@@ -94,11 +86,9 @@ fn main() {
     });
     runner.run("fibonacci_iterative", |bencher| {
         keep_cpu_busy(Duration::from_secs(5));
-        let s = bencher
-            .bench(|| {
-                fibonacci_iterative(black_box(20));
-            })
-            .unwrap();
+        let s = bencher.bench(|| {
+            fibonacci_iterative(black_box(20));
+        });
         println!("s: {s:?}");
     });
     runner.run("Vec::sort", |bencher| {

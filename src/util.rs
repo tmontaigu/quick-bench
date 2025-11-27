@@ -1,4 +1,4 @@
-use std::{borrow::Cow, env::Args};
+use std::{borrow::Cow, env::Args, num::NonZero};
 
 use crate::OrchestratorConfig;
 
@@ -45,9 +45,13 @@ pub(crate) fn parse_args(args: &mut Args) -> OrchestratorConfig {
             };
 
             if key_str == "num-samples" {
-                config.bencher_config.num_samples = value_str.parse::<usize>().unwrap();
+                let value = value_str.parse::<usize>().unwrap();
+                config.bencher_config.num_samples =
+                    NonZero::new(value).expect("num-samples must be > 0");
             } else if key_str == "iter-per-sample" {
-                config.bencher_config.iter_per_sample = value_str.parse::<usize>().unwrap();
+                let value = value_str.parse::<usize>().unwrap();
+                config.bencher_config.iter_per_sample =
+                    NonZero::new(value).expect("iter-per-sample must be > 0");
             } else if key_str == "warmup-samples" {
                 config.bencher_config.warmup_samples = value_str.parse::<usize>().unwrap();
             } else {
