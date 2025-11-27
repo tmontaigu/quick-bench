@@ -63,12 +63,12 @@ enum BenchMode {
 impl BenchMode {
     const DEFAULT_LIMIT: Duration = Duration::from_secs(5);
 
-    fn select<F, O>(f: F) -> Self
+    fn select_with_input<F, I, O>(f: F, input: I) -> Self
     where
-        F: Fn() -> O,
+        F: Fn(I) -> O,
     {
         let start = Instant::now();
-        let _ = f();
+        let _ = f(input);
         let one_call_duration = start.elapsed();
 
         if one_call_duration >= Self::DEFAULT_LIMIT {
@@ -118,77 +118,35 @@ where
     //     }
     // }
 
+    #[inline(never)]
     pub fn bench<F, O>(&mut self, f: F) -> Option<Statistics<M::Statistics>>
     where
         F: Fn() -> O,
     {
-        if self.config.num_samples == 0 {
-            return None;
-        }
-
-        let mut outputs = Vec::with_capacity(self.config.iter_per_sample);
-        let (time_limit, iter_per_samples) = match BenchMode::select(&f) {
-            BenchMode::Micro => {
-                self.extra_samples.clear();
-                self.wall_time_samples.clear();
-                for _ in 0..self.config.warmup_samples {
-                    self.sample(&f, self.config.iter_per_sample as u64, &mut outputs);
-                    outputs.clear();
-                }
-
-                (
-                    self.config.time_limit.unwrap_or(Duration::MAX),
-                    self.config.iter_per_sample,
-                )
-            }
-            BenchMode::Macro => (self.config.time_limit.unwrap_or(Duration::from_mins(2)), 1),
-        };
-
-        self.wall_time_samples.clear();
-        self.extra_samples.clear();
-        self.extra_samples.ensure_capacity(self.config.num_samples);
-        self.wall_time_samples
-            .ensure_capacity(self.config.num_samples);
-
-        let start = Instant::now();
-        for sample_index in 0..self.config.num_samples {
-            self.sample(&f, iter_per_samples as u64, &mut outputs);
-            outputs.clear();
-
-            if sample_index != self.config.num_samples - 1 {
-                if start.elapsed() >= time_limit {
-                    println!(
-                        "Timit limit reached, limit: {time_limit:?}, elapsed: {:?}",
-                        start.elapsed()
-                    );
-                    break;
-                }
-            }
-        }
-
-        println!("\tRunning time: {:?}", start.elapsed());
-        let wt_stats = WallTimeStats::compute(
-            &self.wall_time_samples,
-            iter_per_samples as usize,
-            self.throughput,
-        );
-        WallTime::print_stats(&wt_stats);
-
-        let extra_stats = M::compute_statistics(
-            &self.extra_samples,
-            &self.wall_time_samples,
-            iter_per_samples as u64,
-        );
-        M::print_stats(&extra_stats);
-        println!();
-
-        Some(Statistics {
-            wall_time: wt_stats,
-            extra: extra_stats,
-        })
+        // Here we trust and hope that the compiler is able to remove
+        // the extra closure call, and optimize out most of the
+        // `()` being used.
+        //
+        // If we find that its not the case then we would have to
+        // to the inlining by hand
+        self.bench_with_inputs_impl(|| (), |()| f())
     }
 
+    #[inline(never)]
     pub fn bench_with_inputs<G, F, I, R>(
+        &mut self,
+        input_gen: G,
+        f: F,
+    ) -> Option<Statistics<M::Statistics>>
+    where
+        G: Fn() -> I,
+        F: Fn(I) -> R,
+    {
+        self.bench_with_inputs_impl(input_gen, f)
+    }
+
+    #[inline(always)]
+    fn bench_with_inputs_impl<G, F, I, R>(
         &mut self,
         input_gen: G,
         f: F,
@@ -207,65 +165,56 @@ where
         let mut inputs = Vec::with_capacity(self.config.iter_per_sample);
         let mut outputs = Vec::with_capacity(self.config.iter_per_sample);
 
-        for _ in 0..self.config.warmup_samples {
-            for _ in 0..self.config.iter_per_sample {
-                inputs.push(input_gen());
+        let input = input_gen();
+        let (time_limit, iter_per_samples) = match BenchMode::select_with_input(&f, input) {
+            BenchMode::Micro => {
+                for _ in 0..self.config.warmup_samples {
+                    for _ in 0..self.config.iter_per_sample {
+                        inputs.push(input_gen());
+                    }
+                    let _ = self.sample_time_with_inputs(&f, &mut inputs, &mut outputs);
+                    outputs.clear();
+                    self.extra_samples.clear();
+                    self.wall_time_samples.clear();
+                }
+
+                (
+                    self.config.time_limit.unwrap_or(Duration::MAX),
+                    self.config.iter_per_sample,
+                )
             }
-            let _ = self.sample_time_with_inputs(&f, &mut inputs, &mut outputs);
-            outputs.clear();
-            self.extra_samples.clear();
-            self.wall_time_samples.clear();
-        }
+            BenchMode::Macro => (self.config.time_limit.unwrap_or(Duration::from_mins(2)), 1),
+        };
         self.wall_time_samples.clear();
         self.extra_samples.clear();
         self.extra_samples.ensure_capacity(self.config.num_samples);
         self.wall_time_samples
             .ensure_capacity(self.config.num_samples);
 
-        for _ in 0..self.config.num_samples {
-            for _ in 0..self.config.iter_per_sample {
+        let start = Instant::now();
+        for sample_index in 0..self.config.num_samples {
+            for _ in 0..iter_per_samples {
                 inputs.push(input_gen());
             }
             self.sample_time_with_inputs(&f, &mut inputs, &mut outputs);
             outputs.clear();
+
+            if sample_index != self.config.num_samples - 1 {
+                if start.elapsed() >= time_limit {
+                    println!(
+                        "Timit limit reached, limit: {time_limit:?}, elapsed: {:?}",
+                        start.elapsed()
+                    );
+                    break;
+                }
+            }
         }
+        let total_elapsed = start.elapsed();
 
-        let wt_stats = WallTimeStats::compute(
-            &self.wall_time_samples,
-            self.config.iter_per_sample as usize,
-            self.throughput,
-        );
-        WallTime::print_stats(&wt_stats);
+        let stats = self.compute_statistics(iter_per_samples as u64);
+        self.print_stats(&stats, total_elapsed);
 
-        let extra_stats = M::compute_statistics(
-            &self.extra_samples,
-            &self.wall_time_samples,
-            self.config.iter_per_sample as u64,
-        );
-        M::print_stats(&extra_stats);
-
-        Some(Statistics {
-            wall_time: wt_stats,
-            extra: extra_stats,
-        })
-    }
-
-    #[inline]
-    fn sample<F, O>(&mut self, f: &F, iters_per_sample: u64, outputs: &mut Vec<O>)
-    where
-        F: Fn() -> O,
-    {
-        let wt_start = WallTime::start();
-        let extra_start = M::start();
-        for _ in 0..iters_per_sample {
-            let o = f();
-            outputs.push(o);
-        }
-        let wt_sample = WallTime::end(&wt_start);
-        let extra_sample = M::end(&extra_start);
-
-        self.extra_samples.push(extra_sample);
-        self.wall_time_samples.push(wt_sample);
+        Some(stats)
     }
 
     #[inline]
@@ -284,6 +233,31 @@ where
 
         self.extra_samples.push(extra_sample);
         self.wall_time_samples.push(wt_sample);
+    }
+
+    fn compute_statistics(&self, iter_per_samples: u64) -> Statistics<M::Statistics> {
+        let wt_stats = WallTimeStats::compute(
+            &self.wall_time_samples,
+            iter_per_samples as usize,
+            self.throughput,
+        );
+        let extra_stats = M::compute_statistics(
+            &self.extra_samples,
+            &self.wall_time_samples,
+            iter_per_samples as u64,
+        );
+
+        Statistics {
+            wall_time: wt_stats,
+            extra: extra_stats,
+        }
+    }
+
+    fn print_stats(&self, stats: &Statistics<M::Statistics>, total_elapsed: Duration) {
+        println!("\tRunning time: {total_elapsed:?}");
+        WallTime::print_stats(&stats.wall_time);
+        M::print_stats(&stats.extra);
+        println!();
     }
 }
 
@@ -833,17 +807,18 @@ mod wall_time {
 
         fn print_stats(stats: &Self::Statistics) {
             let WallTimeStats {
-                num_outliers: _outliers,
+                num_outliers,
                 min,
                 max,
                 avg,
                 std_dev: stddev,
                 throughput,
             } = stats;
-            // println!("\tSamples: {}, Outliers: {}", stats.samples.len(), outliers);
-            println!(
-                "\tWallTime: Average: {avg:?}, min: {min:?}, max: {max:?}, stddev: {stddev:?}"
-            );
+
+            println!("\tWallTime:");
+            println!("\t\tOutliers: {}", num_outliers);
+            println!("\t\taverage: {avg:?}, min: {min:?}, max: {max:?}, stddev: {stddev:?}");
+
             if let Some(t) = throughput {
                 println!("\tThroughput: {t} e/s");
             }
