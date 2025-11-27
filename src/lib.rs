@@ -61,7 +61,7 @@ enum BenchMode {
 }
 
 impl BenchMode {
-    const DEFAULT_LIMIT: Duration = Duration::from_secs(5);
+    const DEFAULT_LIMIT: Duration = Duration::from_secs(1);
 
     fn select_with_input<F, I, O>(f: F, input: I) -> Self
     where
