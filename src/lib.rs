@@ -136,7 +136,7 @@ where
     #[inline(never)]
     pub fn bench_with_inputs<G, F, I, R>(&mut self, input_gen: G, f: F) -> Statistics<M::Statistics>
     where
-        G: Fn() -> I,
+        G: FnMut() -> I,
         F: Fn(I) -> R,
     {
         self.bench_with_inputs_impl(input_gen, f)
@@ -145,11 +145,11 @@ where
     #[inline(always)]
     fn bench_with_inputs_impl<G, F, I, R>(
         &mut self,
-        input_gen: G,
+        mut input_gen: G,
         f: F,
     ) -> Statistics<M::Statistics>
     where
-        G: Fn() -> I,
+        G: FnMut() -> I,
         F: Fn(I) -> R,
     {
         self.extra_samples.clear();
@@ -862,7 +862,7 @@ where
         + Div<u32, Output = T>,
 {
     if input.len() < 4 {
-        return (vec![0, 1, 2], vec![]);
+        return ((0..input.len()).collect(), vec![]);
     }
 
     let mut sorted = input.to_vec();
