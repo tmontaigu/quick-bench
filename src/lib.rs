@@ -13,7 +13,7 @@ mod util;
 pub use quick::QuickBencher;
 
 #[derive(Default)]
-pub struct OrchestratorConfig {
+pub struct Config {
     filter: Option<regex::Regex>,
     bencher_config: BencherConfig,
 }

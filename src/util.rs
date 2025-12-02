@@ -1,10 +1,10 @@
 use std::{borrow::Cow, env::Args, num::NonZero};
 
-use crate::OrchestratorConfig;
+use crate::Config;
 
-pub(crate) fn parse_args(args: &mut Args) -> OrchestratorConfig {
+pub(crate) fn parse_args(args: &mut Args) -> Config {
     let iter = args.by_ref();
-    let mut config = OrchestratorConfig::default();
+    let mut config = Config::default();
 
     // Skip first arg, which is the binary name
     if iter.next().is_none() {
