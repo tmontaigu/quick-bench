@@ -103,14 +103,14 @@ where
     type Extra = E;
 }
 
-pub struct GenericBencher<M: Metric = WallTime> {
+pub struct Bencher<M: Metric = WallTime> {
     pub config: BencherConfig,
     wall_time_samples: Vec<WallTimeSample>,
     extra_samples: <M::Extra as ExtraMetric>::SampleCollection,
     throughput: Option<Throughput>,
 }
 
-impl<M> GenericBencher<M>
+impl<M> Bencher<M>
 where
     M: Metric,
 {
@@ -303,8 +303,6 @@ where
     }
 }
 
-pub type Bencher = GenericBencher<WallTime>;
-
 pub type BoxedBench = Box<dyn FnMut(&'_ mut Bencher)>;
 
 pub struct BenchStore {
@@ -397,7 +395,7 @@ where
 {
     filter: Option<regex::Regex>,
     default_config: BencherConfig,
-    bencher: GenericBencher<M>,
+    bencher: Bencher<M>,
 }
 
 impl<M> Runner<M>
@@ -408,7 +406,7 @@ where
         let default_config = BencherConfig::default();
         Self {
             filter: None,
-            bencher: GenericBencher::new(default_config),
+            bencher: Bencher::new(default_config),
             default_config,
         }
     }
@@ -425,7 +423,7 @@ where
         self
     }
 
-    pub fn run(&mut self, id: &str, mut callback: impl FnMut(&mut GenericBencher<M>)) {
+    pub fn run(&mut self, id: &str, mut callback: impl FnMut(&mut Bencher<M>)) {
         let should_run = self.filter.as_ref().is_none_or(|regex| regex.is_match(id));
 
         if should_run {
@@ -464,12 +462,12 @@ where
 {
     fn write_name(&self, args: &A, name: &mut String);
 
-    fn execute(&mut self, bencher: &mut GenericBencher<M>, args: A);
+    fn execute(&mut self, bencher: &mut Bencher<M>, args: A);
 }
 
 impl<F, A, M> Benchable<A, M> for (&str, F)
 where
-    F: Fn(&mut GenericBencher<M>, A),
+    F: Fn(&mut Bencher<M>, A),
     A: std::fmt::Debug + 'static,
     M: Metric,
 {
@@ -482,7 +480,7 @@ where
         }
     }
 
-    fn execute(&mut self, bencher: &mut GenericBencher<M>, args: A) {
+    fn execute(&mut self, bencher: &mut Bencher<M>, args: A) {
         self.1(bencher, args);
     }
 }
