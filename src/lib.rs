@@ -18,12 +18,6 @@ pub struct Config {
     bencher_config: BencherConfig,
 }
 
-// Feature List:
-// * Use time for warmup, i.e., warmup for x seconds
-//   to allow user to then parse its own args. (or use `--` as separator)
-// * override bencher settings
-// * write measurements to file to be able to print some diff
-
 #[derive(Clone, Copy, Debug)]
 pub enum Throughput {
     Elements(u64),
@@ -80,22 +74,51 @@ impl BenchMode {
     }
 }
 
-pub struct GenericBencher<M: ExtraMetric = NoExtraMetric> {
+mod private {
+    use crate::ExtraMetric;
+
+    pub trait Sealed {}
+
+    impl<E> Sealed for super::WallTimeAnd<E> where E: ExtraMetric {}
+}
+
+pub trait Metric: private::Sealed {
+    type Extra: ExtraMetric;
+}
+
+// This struct and the [Metric] trait are just here for syntactic sugar
+// `::<WallTime>()` over ::<NoExtraMetric>()
+// `::<WallTimeAnd<CpuLoad>>()` over ::<CpuLoad>()
+// so that it's clear that wall time is still measured and is mandatory
+pub struct WallTimeAnd<E: ExtraMetric> {
+    _p: std::marker::PhantomData<E>,
+}
+
+pub type WallTime = WallTimeAnd<NoExtraMetric>;
+
+impl<E> Metric for WallTimeAnd<E>
+where
+    E: ExtraMetric,
+{
+    type Extra = E;
+}
+
+pub struct GenericBencher<M: Metric = WallTime> {
     pub config: BencherConfig,
     wall_time_samples: Vec<WallTimeSample>,
-    extra_samples: M::SampleCollection,
+    extra_samples: <M::Extra as ExtraMetric>::SampleCollection,
     throughput: Option<Throughput>,
 }
 
 impl<M> GenericBencher<M>
 where
-    M: ExtraMetric,
+    M: Metric,
 {
     pub fn new(config: BencherConfig) -> Self {
         Self {
             config,
             wall_time_samples: vec![],
-            extra_samples: M::SampleCollection::new(),
+            extra_samples: <M::Extra as ExtraMetric>::SampleCollection::new(),
             throughput: None,
         }
     }
@@ -120,7 +143,7 @@ where
     // }
 
     #[inline(never)]
-    pub fn bench<F, O>(&mut self, f: F) -> Statistics<M::Statistics>
+    pub fn bench<F, O>(&mut self, f: F) -> Statistics<<M::Extra as ExtraMetric>::Statistics>
     where
         F: Fn() -> O,
     {
@@ -134,7 +157,11 @@ where
     }
 
     #[inline(never)]
-    pub fn bench_with_inputs<G, F, I, R>(&mut self, input_gen: G, f: F) -> Statistics<M::Statistics>
+    pub fn bench_with_inputs<G, F, I, R>(
+        &mut self,
+        input_gen: G,
+        f: F,
+    ) -> Statistics<<M::Extra as ExtraMetric>::Statistics>
     where
         G: Fn() -> I,
         F: Fn(I) -> R,
@@ -147,7 +174,7 @@ where
         &mut self,
         input_gen: G,
         f: F,
-    ) -> Statistics<M::Statistics>
+    ) -> Statistics<<M::Extra as ExtraMetric>::Statistics>
     where
         G: Fn() -> I,
         F: Fn(I) -> R,
@@ -229,13 +256,13 @@ where
         F: Fn(I) -> O,
     {
         let wt_start = WallTimeInstant::now();
-        let extra_start = M::start();
+        let extra_start = M::Extra::start();
         for input in inputs.drain(..) {
             let o = f(input);
             outputs.push(o);
         }
         let wt_sample = wt_start.elapsed();
-        let extra_sample = M::end(&extra_start);
+        let extra_sample = M::Extra::end(&extra_start);
 
         self.extra_samples.push(extra_sample);
         self.wall_time_samples.push(wt_sample);
@@ -243,13 +270,16 @@ where
         wt_sample
     }
 
-    fn compute_statistics(&self, iter_per_samples: u64) -> Statistics<M::Statistics> {
+    fn compute_statistics(
+        &self,
+        iter_per_samples: u64,
+    ) -> Statistics<<M::Extra as ExtraMetric>::Statistics> {
         let wt_stats = WallTimeStats::compute(
             &self.wall_time_samples,
             iter_per_samples as usize,
             self.throughput,
         );
-        let extra_stats = M::compute_statistics(
+        let extra_stats = M::Extra::compute_statistics(
             &self.extra_samples,
             &self.wall_time_samples,
             iter_per_samples,
@@ -261,15 +291,19 @@ where
         }
     }
 
-    fn print_stats(&self, stats: &Statistics<M::Statistics>, total_elapsed: Duration) {
+    fn print_stats(
+        &self,
+        stats: &Statistics<<M::Extra as ExtraMetric>::Statistics>,
+        total_elapsed: Duration,
+    ) {
         println!("\tRunning time: {total_elapsed:?}");
         stats.wall_time.print_stats();
-        M::print_stats(&stats.extra);
+        M::Extra::print_stats(&stats.extra);
         println!();
     }
 }
 
-pub type Bencher = GenericBencher<NoExtraMetric>;
+pub type Bencher = GenericBencher<WallTime>;
 
 pub type BoxedBench = Box<dyn FnMut(&'_ mut Bencher)>;
 
@@ -357,9 +391,9 @@ impl Default for BenchStore {
     }
 }
 
-pub struct Runner<M = NoExtraMetric>
+pub struct Runner<M = WallTime>
 where
-    M: ExtraMetric,
+    M: Metric,
 {
     filter: Option<regex::Regex>,
     default_config: BencherConfig,
@@ -368,7 +402,7 @@ where
 
 impl<M> Runner<M>
 where
-    M: ExtraMetric,
+    M: Metric,
 {
     pub fn new() -> Self {
         let default_config = BencherConfig::default();
@@ -426,7 +460,7 @@ where
 
 pub trait Benchable<A, M>
 where
-    M: ExtraMetric,
+    M: Metric,
 {
     fn write_name(&self, args: &A, name: &mut String);
 
@@ -437,7 +471,7 @@ impl<F, A, M> Benchable<A, M> for (&str, F)
 where
     F: Fn(&mut GenericBencher<M>, A),
     A: std::fmt::Debug + 'static,
-    M: ExtraMetric,
+    M: Metric,
 {
     fn write_name(&self, args: &A, name: &mut String) {
         use std::any::TypeId;
@@ -455,7 +489,7 @@ where
 
 impl Default for Runner {
     fn default() -> Self {
-        Runner::<NoExtraMetric>::new()
+        Runner::<WallTime>::new()
     }
 }
 
@@ -517,52 +551,30 @@ pub trait ExtraMetric {
     fn print_stats(stats: &Self::Statistics);
 }
 
-pub struct MultiSample2<A, B>
+impl<A, B> SampleCollection for (A, B)
 where
-    A: ExtraMetric,
-    B: ExtraMetric,
-{
-    a: A::SampleCollection,
-    b: B::SampleCollection,
-}
-
-impl<A, B> SampleCollection for MultiSample2<A, B>
-where
-    A: ExtraMetric,
-    B: ExtraMetric,
+    A: SampleCollection,
+    B: SampleCollection,
 {
     type Sample = (A::Sample, B::Sample);
 
     fn clear(&mut self) {
-        self.a.clear();
-        self.b.clear();
+        self.0.clear();
+        self.1.clear();
     }
 
     fn new() -> Self {
-        Self {
-            a: A::SampleCollection::new(),
-            b: B::SampleCollection::new(),
-        }
-    }
-
-    fn push(&mut self, (a, b): Self::Sample) {
-        self.a.push(a);
-        self.b.push(b);
+        (A::new(), B::new())
     }
 
     fn ensure_capacity(&mut self, cap: usize) {
-        self.a.ensure_capacity(cap);
-        self.b.ensure_capacity(cap);
+        self.0.ensure_capacity(cap);
+        self.1.ensure_capacity(cap);
     }
-}
 
-impl<A, B> Default for MultiSample2<A, B>
-where
-    A: ExtraMetric,
-    B: ExtraMetric,
-{
-    fn default() -> Self {
-        Self::new()
+    fn push(&mut self, (a, b): Self::Sample) {
+        self.0.push(a);
+        self.1.push(b);
     }
 }
 
@@ -575,7 +587,7 @@ where
 
     type Sample = (A::Sample, B::Sample);
 
-    type SampleCollection = MultiSample2<A, B>;
+    type SampleCollection = (A::SampleCollection, B::SampleCollection);
 
     type Statistics = (A::Statistics, B::Statistics);
 
@@ -593,8 +605,8 @@ where
         iters_per_sample: u64,
     ) -> Self::Statistics {
         (
-            A::compute_statistics(&samples.a, wt_stats, iters_per_sample),
-            B::compute_statistics(&samples.b, wt_stats, iters_per_sample),
+            A::compute_statistics(&samples.0, wt_stats, iters_per_sample),
+            B::compute_statistics(&samples.1, wt_stats, iters_per_sample),
         )
     }
 

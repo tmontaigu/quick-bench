@@ -1,6 +1,6 @@
 use std::hint::black_box;
 
-use quick_bench::{GenericBencher, Runner, cpu_time::CpuLoad};
+use quick_bench::{GenericBencher, Runner, WallTimeAnd, cpu_time::CpuLoad};
 
 fn fibonacci_recursive_if(n: i32) -> i32 {
     if n <= 0 {
@@ -20,7 +20,7 @@ fn work() {
     }
 }
 fn main() {
-    let mut runner = Runner::<CpuLoad>::new().setup_from_cmdline();
+    let mut runner = Runner::<WallTimeAnd<(CpuLoad, CpuLoad)>>::new().setup_from_cmdline();
 
     runner.run_with(
         ("hello", |bencher: &mut GenericBencher<_>, _| {
